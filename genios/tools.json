@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "adapter": {
+    "name": "ScholarFlow GeniOS Adapter",
+    "version": "1.0.0",
+    "base_url_env": "GENIOS_BASE_URL",
+    "authentication": "Configure at the GeniOS workflow gateway; ScholarFlow keeps no embedded secret.",
+    "orchestration_note": "Nankai GeniOS is the top-level Agent and Workflow platform. These are stateless HTTP tool calls over persistent ScholarFlow project state."
+  },
+  "tools": [
+    {
+      "name": "project_create",
+      "description": "Create a persistent ScholarFlow research project before other project tools are called.",
+      "method": "POST",
+      "path": "/api/genios/project/create",
+      "input_schema": {"type":"object","required":["name","idea"],"properties":{"name":{"type":"string"},"idea":{"type":"string"},"direction":{"type":"string"},"description":{"type":"string"}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "project_status",
+      "description": "Read project memory, progress counters, current research stage and deterministic next action.",
+      "method": "POST",
+      "path": "/api/genios/project/status",
+      "input_schema": {"$ref":"#/$defs/project_id"},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "research_plan",
+      "description": "Turn a rough research idea into questions, keywords, hypotheses and a task plan, then persist them.",
+      "method": "POST",
+      "path": "/api/genios/research/plan",
+      "input_schema": {"type":"object","required":["project_id"],"properties":{"project_id":{"type":"integer","minimum":1},"idea":{"type":"string"}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "literature_search",
+      "description": "Search real scholarly metadata through OpenAlex. Returned works are not persisted until literature_add is called.",
+      "method": "POST",
+      "path": "/api/genios/literature/search",
+      "input_schema": {"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":2},"year_from":{"type":"integer","minimum":1900},"year_to":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":25}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "literature_add",
+      "description": "Add a selected OpenAlex or manually supplied paper record to a project library with deduplication by DOI/source ID.",
+      "method": "POST",
+      "path": "/api/genios/literature/add",
+      "input_schema": {"type":"object","required":["project_id","paper"],"properties":{"project_id":{"type":"integer","minimum":1},"paper":{"type":"object","required":["title"],"properties":{"title":{"type":"string"},"authors":{"type":"array","items":{"type":"string"}},"year":{"type":["integer","null"]},"venue":{"type":"string"},"doi":{"type":["string","null"]},"abstract":{"type":"string"},"source":{"type":"string"},"source_id":{"type":["string","null"]},"cited_by_count":{"type":"integer"}},"additionalProperties":true}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "paper_parse",
+      "description": "Parse a base64-encoded PDF, create a project paper record, and preserve extracted sections and source text.",
+      "method": "POST",
+      "path": "/api/genios/paper/parse",
+      "input_schema": {"type":"object","required":["project_id","filename","pdf_base64"],"properties":{"project_id":{"type":"integer","minimum":1},"filename":{"type":"string","pattern":"\\.pdf$"},"pdf_base64":{"type":"string","contentEncoding":"base64"}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "paper_ask",
+      "description": "Answer a question from locally retrieved paper text and return citation snippets. It never invents a source.",
+      "method": "POST",
+      "path": "/api/genios/paper/ask",
+      "input_schema": {"type":"object","required":["paper_id","question"],"properties":{"paper_id":{"type":"integer","minimum":1},"question":{"type":"string","minLength":2}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "evidence_extract",
+      "description": "Extract a structured evidence row from one project paper and preserve its source snippet.",
+      "method": "POST",
+      "path": "/api/genios/evidence/extract",
+      "input_schema": {"type":"object","required":["project_id","paper_id"],"properties":{"project_id":{"type":"integer","minimum":1},"paper_id":{"type":"integer","minimum":1}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "gap_analyze",
+      "description": "Analyze evidence coverage and contradictions, persist a research gap, and return supporting project paper IDs.",
+      "method": "POST",
+      "path": "/api/genios/gap/analyze",
+      "input_schema": {"$ref":"#/$defs/project_id"},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "research_design",
+      "description": "Convert the active research gap into hypotheses, variables, controls, metrics, risks and persisted experiments.",
+      "method": "POST",
+      "path": "/api/genios/research/design",
+      "input_schema": {"$ref":"#/$defs/project_id"},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "data_analyze",
+      "description": "Run pandas, NumPy and SciPy analysis on JSON rows or a base64 CSV/XLSX/JSON file and produce chart URLs.",
+      "method": "POST",
+      "path": "/api/genios/data/analyze",
+      "input_schema": {"type":"object","required":["project_id"],"properties":{"project_id":{"type":"integer","minimum":1},"filename":{"type":"string"},"rows":{"type":"array","items":{"type":"object"}},"file_base64":{"type":"string","contentEncoding":"base64"}},"oneOf":[{"required":["rows"]},{"required":["file_base64"]}],"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "writing_draft",
+      "description": "Draft one manuscript section strictly from project evidence; unsupported claims are explicitly marked.",
+      "method": "POST",
+      "path": "/api/genios/writing/draft",
+      "input_schema": {"type":"object","required":["project_id","section"],"properties":{"project_id":{"type":"integer","minimum":1},"section":{"type":"string","enum":["Abstract","Introduction","Related Work","Method","Experiments","Results","Discussion","Conclusion"]}},"additionalProperties":false},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    },
+    {
+      "name": "project_next_action",
+      "description": "Return the deterministic next best research action for GeniOS to reason over and execute.",
+      "method": "POST",
+      "path": "/api/genios/project/next-action",
+      "input_schema": {"$ref":"#/$defs/project_id"},
+      "output_schema": {"$ref":"#/$defs/envelope"}
+    }
+  ],
+  "$defs": {
+    "project_id": {"type":"object","required":["project_id"],"properties":{"project_id":{"type":"integer","minimum":1}},"additionalProperties":false},
+    "envelope": {"type":"object","required":["ok","data"],"properties":{"ok":{"const":true},"data":{},"tool":{"type":"string"}},"additionalProperties":true},
+    "error": {"type":"object","required":["ok","error"],"properties":{"ok":{"const":false},"error":{"type":"object","required":["code","message"],"properties":{"code":{"type":"string"},"message":{"type":"string"}}}}}
+  }
+}
