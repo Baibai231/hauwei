@@ -52,6 +52,10 @@ data/charts/*
 # Local editor, OS and diagnostic output
 .idea/
 .vscode/
+
+# Local analysis notes (kept out of the published repository)
+docs/
+
 .DS_Store
 Thumbs.db
 Desktop.ini

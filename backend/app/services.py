@@ -55,17 +55,17 @@ def create_project(data: dict[str, Any]) -> dict[str, Any]:
     return get_project(project_id)
 
 
-def list_projects() -> list[dict[str, Any]]:
+def list_projects(lang: str = "en") -> list[dict[str, Any]]:
     with connection() as conn:
         projects = rows_to_dicts(conn.execute("SELECT * FROM projects ORDER BY updated_at DESC").fetchall())
-    return [enrich_project(p) for p in projects]
+    return [enrich_project(p, lang) for p in projects]
 
 
-def get_project(project_id: int) -> dict[str, Any]:
-    return enrich_project(project_or_404(project_id))
+def get_project(project_id: int, lang: str = "en") -> dict[str, Any]:
+    return enrich_project(project_or_404(project_id), lang)
 
 
-def enrich_project(project: dict[str, Any]) -> dict[str, Any]:
+def enrich_project(project: dict[str, Any], lang: str = "en") -> dict[str, Any]:
     pid = project["id"]
     with connection() as conn:
         counts = conn.execute(
@@ -82,7 +82,7 @@ def enrich_project(project: dict[str, Any]) -> dict[str, Any]:
             """, (pid, pid, pid, pid, pid, pid, pid, pid, pid)).fetchone()
         tasks = rows_to_dicts(conn.execute("SELECT * FROM tasks WHERE project_id=? ORDER BY id", (pid,)).fetchall())
     project.update(dict(counts))
-    project["next_action"] = determine_next_action(project)
+    project["next_action"] = determine_next_action(project, lang)
     project["progress"] = project["next_action"]["progress"]
     project["tasks"] = tasks
     return project
@@ -410,17 +410,28 @@ def analyze_gap(project_id: int) -> dict[str, Any]:
     weak = [item for item in evidence if float(item.get("confidence") or 0) < .6]
     citations = [item["paper_id"] for item in evidence[:5]]
     gap = f"项目已有 {len(evidence)} 条证据与 {len(claims)} 个 Claim，但低置信证据占 {len(weak)} 条。不同数据子集上的稳定性、负面结果与方法成本尚未形成充分交叉验证。建议优先设计分组对照实验，并用真实导入文献替换 demo/sample 证据。"
+    contradictions: list[str] = []
+    if weak:
+        contradictions.append(f"有 {len(weak)} 条低置信证据需要复核后确认结论方向。")
+    if len(claims) < len(evidence):
+        contradictions.append("部分证据尚未转化为可追溯的 Claim，结论覆盖面可能不完整。")
+    if not contradictions:
+        contradictions.append("当前证据之间尚未发现明显矛盾，仍需扩大来源范围以验证结论稳定性。")
     update_project(project_id, {"research_gap": gap, "gap_citations": citations, "stage": "design"})
-    return {"gap": gap, "citations": citations, "coverage": [{"question": rq, "evidence_count": max(0, len(evidence)//max(1,len(project["research_questions"]))) } for rq in project["research_questions"]], "contradictions": ["当前存在“召回率提升”与“误报增加”的潜在权衡，需要统一实验验证。"]}
+    return {"gap": gap, "citations": citations, "coverage": [{"question": rq, "evidence_count": max(0, len(evidence)//max(1,len(project["research_questions"]))) } for rq in project["research_questions"]], "contradictions": contradictions}
 
 
 def create_research_design(project_id: int) -> dict[str, Any]:
     project = get_project(project_id)
-    rq = project["research_questions"] or ["Primary research question"]
-    hypothesis = (project["hypotheses"] or ["The proposed method improves the primary metric."])[0]
+    topic = (project["idea"] or project["name"]).strip().rstrip("。.!?！？")
+    rq = project["research_questions"] or [f"How does {topic} compare with the baseline on the target task?"]
+    hypothesis = (project["hypotheses"] or ["The proposed method improves the primary metric over the baseline."])[0]
+    metrics = ["Primary effect metric", "Runtime cost / latency"]
+    controls = ["Dataset and split", "Parameters", "Random seed"]
+    risks = ["Data leakage", "Metric selection bias", "Insufficient sample size", "Unverified evidence"]
     designs = [
-        {"name":"Baseline Control","research_question":rq[0],"hypothesis":"建立可复现的无增强基线。","description":"固定数据、提示与模型参数，记录基线性能。","status":"Ready","input":"Baseline configuration","dataset":"Project dataset","metrics":["Precision","Recall","F1"]},
-        {"name":"Proposed Method","research_question":rq[0],"hypothesis":hypothesis,"description":"只改变核心自变量，与基线进行配对比较。","status":"Planned","input":"Proposed configuration","dataset":"Same project dataset","metrics":["Precision","Recall","F1","Latency"]},
+        {"name":f"Baseline Control: {topic}","research_question":rq[0],"hypothesis":"Establish a reproducible baseline.","description":"Fix the dataset and parameters, then record the baseline on the primary metric.","status":"Ready","input":"Baseline configuration","dataset":"Project dataset","metrics":metrics},
+        {"name":f"Proposed Method: {topic}","research_question":rq[0],"hypothesis":hypothesis,"description":"Change only the core independent variable and compare against the baseline in pairs.","status":"Planned","input":"Proposed configuration","dataset":"Same project dataset","metrics":metrics},
     ]
     created = []
     with connection() as conn:
@@ -429,7 +440,18 @@ def create_research_design(project_id: int) -> dict[str, Any]:
             for item in designs:
                 cursor = conn.execute("""INSERT INTO experiments (project_id,name,research_question,hypothesis,description,status,input,dataset,metrics,result,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (project_id,item["name"],item["research_question"],item["hypothesis"],item["description"],item["status"],item["input"],item["dataset"],dumps(item["metrics"]),"","",now()))
                 created.append(cursor.lastrowid)
-    return {"hypothesis": hypothesis, "variables": {"independent":"Method configuration","dependent":["Primary quality metric","Latency"],"controls":["Dataset","Model","Prompt","Random seed"]}, "dataset":"Use the same held-out project dataset across conditions.", "baselines":["Baseline Control"], "metrics":["Precision","Recall","F1","Latency"], "risks":["Data leakage","Retrieval noise","Insufficient sample size"], "expected_output":"Paired results with confidence intervals and subgroup analysis.", "created_experiment_ids":created}
+    return {
+        "topic": topic,
+        "hypothesis": hypothesis,
+        "variables": {"independent": "Method / treatment configuration", "dependent": metrics, "controls": controls},
+        "dataset": "Compare all conditions on the same dataset and split.",
+        "baselines": [designs[0]["name"]],
+        "metrics": metrics,
+        "risks": risks,
+        "expected_output": "Paired results with confidence intervals and subgroup analysis.",
+        "design_flow": {"control": designs[0]["name"], "treatment": designs[1]["name"], "evaluation": "Paired comparison + subgroup analysis"},
+        "created_experiment_ids": created,
+    }
 
 
 def list_experiments(project_id: int) -> list[dict[str, Any]]:

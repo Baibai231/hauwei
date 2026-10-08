@@ -63,8 +63,8 @@ def health():
 
 
 @app.get("/api/projects")
-def projects():
-    return ok(services.list_projects())
+def projects(lang: str = "en"):
+    return ok(services.list_projects(lang))
 
 
 @app.post("/api/projects")
@@ -73,8 +73,8 @@ def create_project(payload: dict[str, Any] = Body(...)):
 
 
 @app.get("/api/projects/{project_id}")
-def get_project(project_id: int):
-    return ok(services.get_project(project_id))
+def get_project(project_id: int, lang: str = "en"):
+    return ok(services.get_project(project_id, lang))
 
 
 @app.patch("/api/projects/{project_id}")
@@ -224,7 +224,7 @@ def genios_project_create(payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/genios/project/status")
 def genios_project_status(payload: dict[str, Any] = Body(...)):
-    return ok(services.get_project(int(payload["project_id"])), tool="project_status")
+    return ok(services.get_project(int(payload["project_id"]), str(payload.get("lang") or "en")), tool="project_status")
 
 
 @app.post("/api/genios/research/plan")
@@ -296,5 +296,5 @@ def genios_writing_draft(payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/genios/project/next-action")
 def genios_next_action(payload: dict[str, Any] = Body(...)):
-    project = services.get_project(int(payload["project_id"]))
+    project = services.get_project(int(payload["project_id"]), str(payload.get("lang") or "en"))
     return ok(project["next_action"], tool="project_next_action")

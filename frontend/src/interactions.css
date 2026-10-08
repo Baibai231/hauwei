@@ -1,0 +1,83 @@
+/*
+ * Hover micro-interaction: a slight lift plus a brighter border.
+ * Imported after styles.css so it applies consistently to every card,
+ * including the marketing / project-list pages shown before a project is opened.
+ */
+
+.feature-card,
+.project-card,
+.mini-agent,
+.card,
+.paper-row,
+.experiment-card,
+.metric,
+.design-card,
+.flow-node,
+.claim-node,
+.paper-nodes > div,
+.architecture-tools > div,
+.upload-zone {
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.feature-card {
+  display: block;
+}
+
+.feature-card:hover,
+.project-card:hover,
+.mini-agent:hover,
+.card:hover,
+.paper-row:hover,
+.experiment-card:hover,
+.metric:hover,
+.design-card:hover,
+.flow-node:hover,
+.claim-node:hover,
+.paper-nodes > div:hover,
+.architecture-tools > div:hover,
+.upload-zone:hover {
+  transform: translateY(-2px);
+  border-color: #b3c1fb;
+  box-shadow: 0 14px 30px rgba(55, 76, 126, .13);
+}
+
+/* Keep the next-action banner readable: it has no border to brighten. */
+.next-action-card:hover {
+  border-color: transparent;
+  box-shadow: 0 22px 44px rgba(66, 91, 214, .3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feature-card,
+  .project-card,
+  .mini-agent,
+  .card,
+  .paper-row,
+  .experiment-card,
+  .metric,
+  .design-card,
+  .flow-node,
+  .claim-node,
+  .paper-nodes > div,
+  .architecture-tools > div,
+  .upload-zone {
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+
+  .feature-card:hover,
+  .project-card:hover,
+  .mini-agent:hover,
+  .card:hover,
+  .paper-row:hover,
+  .experiment-card:hover,
+  .metric:hover,
+  .design-card:hover,
+  .flow-node:hover,
+  .claim-node:hover,
+  .paper-nodes > div:hover,
+  .architecture-tools > div:hover,
+  .upload-zone:hover {
+    transform: none;
+  }
+}
