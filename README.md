@@ -20,7 +20,8 @@ ScholarFlow 是面向大学生科研过程的项目工作台：把研究问题�
 | 本地网页工作台 | 可运行，项目增删改、文献、证据、实验、分析、写作全流程可用 |
 | AI 接入 | 已实现。支持 OpenAI 兼容接口、NK-GeniOS（Coze）API、本地浏览器桥接三种方式 |
 | 规则回退 | 未配置凭据时自动生效，功能不中断 |
-| 工具接口鉴权 | 支持共享令牌，设置 `GENIOS_TOOL_TOKEN` 后 `/api/genios/*` 需要 Bearer 认证 |
+| 集成方向 | 仅本机出站：由本机调用平台或模型服务，不采用把后端暴露到公网的做法 |
+| 工具接口鉴权 | 内置共享令牌作为纵深防御，设置 `GENIOS_TOOL_TOKEN` 后 `/api/genios/*` 需要 Bearer 认证 |
 | 南开智能体 | 平台侧已发布 `v1.0.0`，可对话与检索，详见 [平台部署状态](genios/deployment-status.md) |
 | 已验证 | 浏览器桥接方案实测通过，返回 `mode: ai:genios_browser` |
 | 已知限制 | 当前南开部署的 `/api/proxy` 被统一认证网关拦截，服务端直连 API 不可行，需使用浏览器桥接 |
@@ -167,31 +168,24 @@ BROWSER_NEW_CONVERSATION=true
 - 浏览器桥接模式下 `browser_bridge.logged_in` 为 `true`
 - AI 功能的返回体 `mode` 由 `deterministic-fallback` 变为 `ai:<provider>`
 
-## 5. 让智能体调用本地工具
+## 5. 关于后端暴露
 
-GeniOS 平台无法访问你电脑的 `127.0.0.1`，需先提供公网可访问地址，并设置工具令牌。
+本项目**不采用将本地后端暴露到公网的做法**。
 
-1. 生成一个强随机字符串，写入 `.env`：
+所有 AI 能力均通过本机出站实现：由本机后端主动调用平台或模型服务，不需要平台反过来访问本机。因此完整功能不依赖入站地址、端口映射或公网隧道。后端默认只监听 `127.0.0.1:8000`。
 
-```env
-GENIOS_TOOL_TOKEN=<一长串随机字符串>
-```
+不采用该方案的原因如下：
 
-设置后所有 `/api/genios/*` 请求都必须携带 `Authorization: Bearer <GENIOS_TOOL_TOKEN>`；未设置时端点保持开放，仅适合本地使用。**公网暴露前必须设置该令牌**，因为当前后端尚无用户隔离与登录。
+- 访问控制只覆盖 `/api/genios/*`，项目、文献、证据、实验、分析等常规接口没有鉴权；
+- `/api/charts` 为静态目录挂载，不受令牌中间件保护；
+- 数据库没有用户隔离，任何调用者看到的都是同一份数据；
+- 上传接口允许 PDF 40 MB、数据文件 30 MB，可被用于消耗磁盘与 CPU；
+- 隧道地址本身即凭据，一旦泄漏即可被直接调用；
+- 工具调用会消耗平台或模型额度，存在成本风险。
 
-2. 暴露后端，任选一种方式：
+代码中的 `GENIOS_TOOL_TOKEN` 仍然保留，作用是纵深防御：当服务部署在受控网络（例如内网服务器）时，它可以把 `/api/genios/*` 限制为持令牌方可访问。设置该令牌并不意味着后端适合公网暴露。
 
-```powershell
-# 终端 1：本地后端
-python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
-
-# 终端 2：临时公网隧道（示例）
-cloudflared tunnel --url http://127.0.0.1:8000
-```
-
-生产环境建议部署到具备 HTTPS、访问控制与限流的服务器，而非临时隧道。
-
-3. 在平台侧注册工具。`genios/tools.json` 定义了 13 个工具，采用 JSON Schema 形式；Coze 插件需要 OpenAPI 3 schema，导入前需将 `$defs` / `$ref` 展开，也可在平台中用 HTTP 请求类型逐个添加。
+若将来确实需要让智能体反向调用本地工具，应优先选择内网可达或反向连接方案，而不是公网暴露，详见 [`genios/ai-integration.md`](genios/ai-integration.md)。
 
 ## 6. 配置项
 
@@ -228,21 +222,21 @@ cloudflared tunnel --url http://127.0.0.1:8000
 - 写作引用是项目内部标记，不是自动核验的正式参考文献；演示内容仍需替换为真实来源。
 - 实验由用户在外部执行后录入结果，当前不包含分组检验、因果推断或机器学习实验执行器。
 - 未配置凭据时全部功能可用，但 OpenAlex 检索与首次依赖安装仍需联网。
-- 当前没有登录、用户隔离机制；公网部署前必须设置 `GENIOS_TOOL_TOKEN`，并建议补充鉴权与限流。
+- 当前没有登录与用户隔离机制，鉴权仅覆盖 `/api/genios/*`。因此项目不采用公网暴露方案，仅在本机或受控内网使用。
 
 ## 8. GeniOS 工具接口
 
 ```mermaid
-flowchart TD
-    G[南开 GeniOS Agent / Workflow] -->|HTTP JSON Tools + Bearer Token| A[ScholarFlow FastAPI]
-    U[React 科研工作台] --> A
-    A --> P[AI Provider：OpenAI 兼容 / Coze / 浏览器桥接]
+flowchart LR
+    U[React 科研工作台] --> A[ScholarFlow FastAPI]
+    A --> P[AI Provider 抽象层]
+    P -->|本机出站| G[NK-GeniOS / OpenAI 兼容模型]
     A --> S[SQLite 项目状态与状态机]
     A --> L[OpenAlex 文献检索]
     A --> D[pandas / SciPy 数据分析]
 ```
 
-工具定义见 [`genios/tools.json`](genios/tools.json)，所有接口使用 `POST`，目标地址应指向 GeniOS 可访问的后端地址。
+工具定义见 [`genios/tools.json`](genios/tools.json)，所有接口使用 `POST`。这些接口用于本机或受控内网环境，当前不将其暴露到公网。
 
 | Tool | API 路径 |
 | --- | --- |
@@ -260,17 +254,18 @@ flowchart TD
 | `writing_draft` | `/api/genios/writing/draft` |
 | `project_next_action` | `/api/genios/project/next-action` |
 
-调用示例（未设置 `GENIOS_TOOL_TOKEN` 时可省略 `Headers`）：
+调用示例：
 
 ```powershell
 Invoke-RestMethod `
   -Uri 'http://127.0.0.1:8000/api/genios/project/next-action' `
   -Method Post -ContentType 'application/json' `
-  -Headers @{ Authorization = 'Bearer <工具令牌>' } `
   -Body '{"project_id":1}'
 ```
 
-通常返回 `{"ok": true, "data": ...}`，GeniOS 入口额外包含 `tool` 字段。`paper_parse` 接收 PDF 的 Base64 字符串，`data_analyze` 接收 JSON `rows` 或 Base64 文件。接入时需处理 HTTP 状态码与 `error` / `detail` 字段。
+若设置了 `GENIOS_TOOL_TOKEN`，则需补充请求头 `-Headers @{ Authorization = 'Bearer <工具令牌>' }`。
+
+通常返回 `{"ok": true, "data": ...}`，GeniOS 入口额外包含 `tool` 字段。`paper_parse` 接收 PDF 的 Base64 字符串，`data_analyze` 接收 JSON `rows` 或 Base64 文件。调用时需处理 HTTP 状态码与 `error` / `detail` 字段。
 
 ## 9. 仓库结构
 
@@ -317,6 +312,7 @@ GitHub Actions 在 push 与 pull request 时运行后端测试（Linux Python 3.
 
 - **AI 显示未连接：** 检查 `.env` 是否存在、`AI_PROVIDER` 是否与所填凭据对应，并确认已重启后端；访问 `/api/health` 查看 `ai_provider` 与 `ai_configured`。
 - **浏览器桥接显示未登录：** 确认带 `--remote-debugging-port=9222` 的浏览器窗口仍开着并已完成统一身份认证；会话过期需重新登录。
+- **为什么不把后端放到公网：** 访问控制只覆盖 `/api/genios/*`，常规接口与 `/api/charts` 静态目录没有鉴权，数据库也没有用户隔离。当前集成方向是本机出站，不需要入站可达，详见第 5 节。
 - **端口被占用：** 检查 `8000` 与 `5173`；Vite 可能自动切换端口，实际地址以终端输出为准，换端口后需同步检查后端 CORS 配置。
 - **PDF 无文本：** 当前解析器不执行 OCR，请使用可选择文本的 PDF。
 - **`.xls` 无法读取：** 默认依赖支持 `.xlsx`，旧版 `.xls` 需额外引擎，建议先转换为 `.xlsx`。

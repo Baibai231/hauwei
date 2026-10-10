@@ -5,18 +5,21 @@
 ## 一、架构
 
 ```
-浏览器 / 本地工作台 ──► 本地 FastAPI（科研状态 + HTTP 工具）
+浏览器 / 本地工作台 ──► 本地 FastAPI（科研状态 + 13 个 HTTP 工具）
                               │
-                              ├─(A) OpenAI 兼容模型  /  (B) NK-GeniOS(Coze) /v3/chat
-                              │
-NK-GeniOS Agent（coze.nankai.edu.cn） ──► 调用 https://<公网后端>/api/genios/*
+                              ├─(A) OpenAI 兼容模型
+                              ├─(B) NK-GeniOS (Coze) /v3/chat
+                              └─(C) 本地浏览器桥接（CDP，复用已登录窗口）
+
+上述三条均为本机出站：由本机主动调用平台或模型服务，平台不需要访问本机。
+13 个工具接口仅供本机或受控内网调用，不暴露到公网。
 ```
 
 - 网站在项目内的 AI 功能（研究规划、研究空白、证据抽取、论文问答、研究设计、写作草稿）由后端 `AI_PROVIDER` 决定用哪个模型。
-- NK-GeniOS 智能体是顶层编排者，通过 `/api/genios/*` 这 13 个工具读写项目状态。
+- 13 个工具接口（`/api/genios/*`）用于本机或受控内网读写项目状态；平台智能体反向编排本地工具的能力当前不启用，详见第三节。
 - 任何凭据都不填写时，接口自动回退到确定性规则（`demo_mode`），功能仍可用。
 
-## 二、第一步：让网站本身用上模型（二选一）
+## 二、第一步：让网站本身用上模型（三种方式任选其一）
 
 ### 方案 A：OpenAI 兼容接口（最快）
 
@@ -108,37 +111,34 @@ BROWSER_NEW_CONVERSATION=true
 - **调试端口只应绑定 127.0.0.1**，演示结束请关闭该浏览器窗口——开着它等于把已登录会话暴露给本机所有进程。
 - 单次调用约 10–20 秒（含模型生成），比直连模型慢，适合演示与人工使用，不适合高并发。
 
-## 三、第二步：让智能体调用本地工具（真正实现 Agent 编排）
+## 三、关于让智能体反向调用本地工具
 
-平台的智能体不能访问你电脑的 `127.0.0.1`，需要先给它一个公网可访问的地址。
+本项目**不采用**"把本地后端暴露到公网、供平台智能体回调"的方案。
 
-1. 生成一个强随机共享密钥，写入 `.env`：
+原因是后端当前的访问控制只覆盖 `/api/genios/*`：项目、文献、证据、实验、分析等常规接口没有鉴权，`/api/charts` 静态目录也不经过令牌中间件，数据库没有用户隔离。配合公网隧道会把项目数据、上传的论文全文与分析图表置于可被任意访问的状态。
 
-```
-GENIOS_TOOL_TOKEN=<一长串随机字符串>
-```
+当前采用的集成方向是**本机出站**：由本机后端主动调用平台或模型服务（方案 A / B / C），平台不需要访问本机地址。该方向已实测可用，且不产生入站暴露面。
 
-重启后端后，所有 `/api/genios/*` 都要求请求头 `Authorization: Bearer <GENIOS_TOOL_TOKEN>`；未配置该变量时保持开放（仅适合本地）。
+`genios/tools.json` 中的 13 个工具接口保留并可用，供本机或受控内网环境调用。若将来确实需要平台智能体反向编排这些工具，应优先考虑以下方向，而不是公网暴露：
 
-2. 暴露后端（任选其一）：
+- 将后端部署在平台可访问的内网地址，不经过公网；
+- 或实现反向连接，由本机主动轮询平台任务，而不是平台连入本机。
 
-```powershell
-# 终端 A：本地后端
-python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+无论采用哪种方式，都应只开放 `/api/genios/*` 前缀，并在受控网络上设置 `GENIOS_TOOL_TOKEN`。
 
-# 终端 B：临时公网隧道（示例）
-cloudflared tunnel --url http://127.0.0.1:8000
-```
+### 关于工具令牌
 
-生产环境建议把后端部署到有 HTTPS、访问控制和限流的服务器，而不是临时隧道。
+`GENIOS_TOOL_TOKEN` 的作用是纵深防御：设置后 `/api/genios/*` 要求请求头 `Authorization: Bearer <GENIOS_TOOL_TOKEN>`；未设置时端点保持开放，仅适合本机使用。
 
-3. 在平台上把工具注册给智能体：
+需要明确的是，该令牌不能弥补常规接口缺少访问控制的问题，因此设置它并不等于后端可以安全暴露到公网。
 
-   - `genios/tools.json` 定义了 13 个工具（`project_create`、`research_plan`、`literature_search`、`evidence_extract`、`gap_analyze`、`research_design`、`data_analyze`、`writing_draft` 等）。
-   - Coze 的插件需要 OpenAPI 3 schema；`tools.json` 是 JSON Schema 形式，导入前需要把 `$defs/$ref` 展开并转成 OpenAPI（也可以在平台里用「HTTP 请求」类型逐个添加：`POST https://<你的域名>/api/genios/...`，Header 加 `Authorization: Bearer <token>`）。
-   - 注册后用平台自带的调试面板发一次请求，确认返回 `{"ok": true, ...}`。
+### 保留的工具注册知识
 
-4. 在智能体提示词里说明：项目状态通过上述工具读写；工具失败要如实说明，不得编造项目 ID。
+下列信息仅在将来采用内网或反向连接方案时才会用到，当前不启用：
+
+- `genios/tools.json` 定义了 13 个工具（`project_create`、`research_plan`、`literature_search`、`evidence_extract`、`gap_analyze`、`research_design`、`data_analyze`、`writing_draft` 等）。
+- Coze 插件需要 OpenAPI 3 schema；`tools.json` 为 JSON Schema 形式，导入前需将 `$defs` / `$ref` 展开并转换。
+- 智能体提示词中需说明：项目状态通过上述工具读写，工具失败应如实说明，不得编造项目 ID。
 
 ## 四、验证清单
 
@@ -153,7 +153,7 @@ cloudflared tunnel --url http://127.0.0.1:8000
 ## 五、安全边界
 
 - 不要把 PAT、统一身份认证 Cookie、密码写进仓库或聊天；`.env` 已被 `.gitignore` 排除。
-- 暴露到公网前必须设置 `GENIOS_TOOL_TOKEN`；当前后端还没有用户隔离与登录，匿名公网暴露有风险。
+- 本项目不采用公网暴露方案。后端当前没有用户隔离与登录，且鉴权仅覆盖 `/api/genios/*`，因此不应直接暴露到公网；`GENIOS_TOOL_TOKEN` 只是纵深防御手段。
 - 平台侧 API 渠道已启用（运行中）；MCP / WebSDK 仍为已停用。由于网关对 `/api/*` 强制统一认证，服务端直连不可行，需要走方案 C 的浏览器桥接。
 - 智能体仍可能受 arXiv 等外部服务限流（HTTP 429）影响，工具失败时应如实返回错误而不是编造结果。
 
@@ -161,4 +161,4 @@ cloudflared tunnel --url http://127.0.0.1:8000
 
 - 已完成（代码）：AI Provider 抽象（OpenAI 兼容 + Coze + 本地浏览器桥接）、把研究规划/研究空白/证据抽取/论文问答/研究设计/写作草稿改为 AI 优先并保留规则回退、工具接口令牌鉴权、`/api/health` 与 Settings 的状态展示、`.env` 模板。
 - 已完成（验证）：方案 C 浏览器桥接实测通过——`AI_PROVIDER=genios_browser` 时研究规划返回智能体真实生成的问题（针对 PCFG 口令猜测主题），`mode: ai:genios_browser`。
-- 已知限制：方案 B（用 API 密钥服务端直连）在当前部署不可行，`/api/*` 被统一认证网关拦截；`genios/tools.json` 的 13 个工具若要被平台调用，仍需公网地址并在平台注册。
+- 已知限制：方案 B（用 API 密钥服务端直连）在当前部署不可行，`/api/*` 被统一认证网关拦截，因此实际使用方案 C。平台智能体反向调用本地工具的能力当前不启用，本项目不采用公网暴露方案；`genios/tools.json` 的工具接口仅供本机或受控内网调用。
