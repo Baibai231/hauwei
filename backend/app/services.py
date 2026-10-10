@@ -19,6 +19,7 @@ from scipy import stats
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+from . import ai, llm
 from .config import CHART_DIR, OPENALEX_EMAIL, UPLOAD_DIR
 from .database import connection, dumps, now, row_to_dict, rows_to_dicts
 from .state_machine import determine_next_action
@@ -111,33 +112,50 @@ def delete_project(project_id: int) -> None:
         conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
 
 
-def plan_research(project_id: int, idea: str | None = None) -> dict[str, Any]:
+def plan_research(project_id: int, idea: str | None = None, lang: str = "zh") -> dict[str, Any]:
     project = project_or_404(project_id)
     topic = (idea or project["idea"] or project["name"]).strip()
     cleaned = re.sub(r"[。.!?？]+$", "", topic)
-    keywords = extract_keywords(cleaned)
-    questions = [
-        f"RQ1: {cleaned}在目标任务上的效果相较基线如何？",
-        "RQ2: 该方法在不同数据子集或场景中的效果是否一致？",
-        "RQ3: 哪些关键因素影响效果、成本与可靠性之间的权衡？",
-    ]
-    hypotheses = [
-        "H1: 所研究方法相较基线在主要评价指标上有显著改进。",
-        "H2: 方法收益会随数据特征或任务类别而变化。",
-    ]
-    tasks = [
-        "明确研究对象、对照组和主要评价指标",
-        "检索并筛选核心文献",
-        "建立证据矩阵并识别矛盾结论",
-        "设计可复现的对照实验",
-        "执行统计分析并回链研究问题",
-    ]
+    plan = ai.research_plan(cleaned, project, lang)
+    mode = "deterministic-fallback"
+    if plan:
+        questions = [str(x).strip() for x in (plan.get("research_questions") or []) if str(x).strip()][:5]
+        keywords = [str(x).strip() for x in (plan.get("keywords") or []) if str(x).strip()][:8]
+        hypotheses = [str(x).strip() for x in (plan.get("hypotheses") or []) if str(x).strip()][:4]
+        tasks = [str(x).strip() for x in (plan.get("tasks") or []) if str(x).strip()][:8]
+        if questions and keywords and hypotheses and tasks:
+            mode = f"ai:{llm.active_provider()}"
+        else:
+            plan = None
+    if not plan:
+        keywords = extract_keywords(cleaned)
+        questions = [
+            f"RQ1: {cleaned}在目标任务上的效果相较基线如何？",
+            "RQ2: 该方法在不同数据子集或场景中的效果是否一致？",
+            "RQ3: 哪些关键因素影响效果、成本与可靠性之间的权衡？",
+        ]
+        hypotheses = [
+            "H1: 所研究方法相较基线在主要评价指标上有显著改进。",
+            "H2: 方法收益会随数据特征或任务类别而变化。",
+        ]
+        tasks = [
+            "明确研究对象、对照组和主要评价指标",
+            "检索并筛选核心文献",
+            "建立证据矩阵并识别矛盾结论",
+            "设计可复现的对照实验",
+            "执行统计分析并回链研究问题",
+        ]
+        objective = f"围绕“{cleaned}”形成可验证、可追溯的研究结论。"
+        scope = "以可获得的同行评议文献、可复现实验数据和项目证据为边界。"
+    else:
+        objective = str(plan.get("objective") or f"围绕“{cleaned}”形成可验证、可追溯的研究结论。")
+        scope = str(plan.get("scope") or "以可获得的同行评议文献、可复现实验数据和项目证据为边界。")
     with connection() as conn:
         conn.execute("UPDATE projects SET research_questions=?,keywords=?,hypotheses=?,stage='literature',updated_at=? WHERE id=?", (dumps(questions),dumps(keywords),dumps(hypotheses),now(),project_id))
         conn.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
         for title in tasks:
             conn.execute("INSERT INTO tasks (project_id,title,phase,done) VALUES (?,?,?,0)", (project_id,title,"Planner"))
-    return {"objective": f"围绕“{cleaned}”形成可验证、可追溯的研究结论。", "research_questions": questions, "keywords": keywords, "scope": "以可获得的同行评议文献、可复现实验数据和项目证据为边界。", "hypotheses": hypotheses, "tasks": tasks, "mode": "deterministic-fallback"}
+    return {"objective": objective, "research_questions": questions, "keywords": keywords, "scope": scope, "hypotheses": hypotheses, "tasks": tasks, "mode": mode}
 
 
 def extract_keywords(text: str) -> list[str]:
@@ -302,7 +320,7 @@ def split_sections(text: str) -> list[dict[str, str]]:
     return [s for s in sections if s["content"]]
 
 
-def ask_paper(paper_id: int, question: str) -> dict[str, Any]:
+def ask_paper(paper_id: int, question: str, lang: str = "zh") -> dict[str, Any]:
     paper = get_paper(paper_id)
     text = paper.get("full_text") or paper.get("abstract") or ""
     if not text:
@@ -310,8 +328,23 @@ def ask_paper(paper_id: int, question: str) -> dict[str, Any]:
     chunks = [text[i:i+1000] for i in range(0, len(text), 800)]
     query_terms = set(re.findall(r"\w+", question.lower()))
     scored = sorted(((sum(term in chunk.lower() for term in query_terms), index, chunk) for index,chunk in enumerate(chunks)), reverse=True)
-    best = [item for item in scored if item[0] > 0][:3] or scored[:1]
+    hits = [item for item in scored if item[0] > 0][:3]
+    if hits:
+        best = hits
+    else:
+        # A Chinese question over an English paper matches nothing, which used to
+        # collapse the context to the first chunk (the cover page). Sample across
+        # the whole document instead so the model gets usable material.
+        total = len(chunks)
+        picks = sorted({0, total // 3, (2 * total) // 3}) if total else [0]
+        best = [(0, index, chunks[index]) for index in picks if index < total][:3]
     citations = [{"paper_id": paper_id, "title": paper["title"], "chunk": index + 1, "snippet": chunk[:420]} for _,index,chunk in best]
+    # Give the model more context than the UI needs, otherwise it can only answer
+    # "材料未提供" because each snippet is too short to contain the answer.
+    context = [{"chunk": index + 1, "snippet": chunk[:1200]} for _, index, chunk in best]
+    ai_answer = ai.paper_answer(question, context, lang)
+    if ai_answer and ai_answer.strip():
+        return {"answer": ai_answer.strip(), "citations": citations, "mode": f"ai:{llm.active_provider()}"}
     answer = "基于论文中最相关的片段，建议重点核对以下证据：" + " ".join(c["snippet"][:180] for c in citations)
     return {"answer": answer, "citations": citations, "mode": "local-retrieval", "warning": "未配置 LLM 时仅返回检索式答案，不扩写未经证实的结论。"}
 
@@ -323,7 +356,7 @@ def list_evidence(project_id: int) -> list[dict[str, Any]]:
         return rows_to_dicts(rows)
 
 
-def extract_evidence(project_id: int, paper_id: int) -> dict[str, Any]:
+def extract_evidence(project_id: int, paper_id: int, lang: str = "zh") -> dict[str, Any]:
     paper = get_paper(paper_id)
     if paper["project_id"] != project_id:
         raise ValueError("Paper does not belong to this project")
@@ -331,22 +364,33 @@ def extract_evidence(project_id: int, paper_id: int) -> dict[str, Any]:
     sentences = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", text) if len(s.strip()) > 25]
     def find(words: list[str]) -> str:
         return next((s for s in sentences if any(w in s.lower() for w in words)), "")
-    values = {
-        "problem": find(["problem","challenge","aim","objective","问题","目标"]),
-        "method": find(["method","approach","model","方法","模型"]),
-        "dataset": find(["dataset","benchmark","corpus","数据集"]),
-        "baseline": find(["baseline","compare","comparison","基线","对比"]),
-        "metric": find(["accuracy","precision","recall","f1","metric","指标"]),
-        "result": find(["result","improve","outperform","结果","提升"]),
-        "limitation": find(["limitation","however","future","局限","不足"]),
-    }
+    source ="auto-extracted-rules"
+    values = None
+    ai_fields = ai.evidence_fields(paper, text, lang)
+    if ai_fields:
+        candidate = {key: str(ai_fields.get(key) or "").strip() for key in ("problem","method","dataset","baseline","metric","result","limitation")}
+        if any(candidate.values()):
+            values = candidate
+            source = f"ai:{llm.active_provider()}"
+    if values is None:
+        values = {
+            "problem": find(["problem","challenge","aim","objective","问题","目标"]),
+            "method": find(["method","approach","model","方法","模型"]),
+            "dataset": find(["dataset","benchmark","corpus","数据集"]),
+            "baseline": find(["baseline","compare","comparison","基线","对比"]),
+            "metric": find(["accuracy","precision","recall","f1","metric","指标"]),
+            "result": find(["result","improve","outperform","结果","提升"]),
+            "limitation": find(["limitation","however","future","局限","不足"]),
+        }
     snippet = values["result"] or values["method"] or (sentences[0] if sentences else text[:500])
     with connection() as conn:
         cursor = conn.execute("""INSERT INTO evidence
         (project_id,paper_id,problem,method,dataset,baseline,metric,result,limitation,source_section,source_snippet,confidence,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (project_id,paper_id,values["problem"],values["method"],values["dataset"],values["baseline"],values["metric"],values["result"],values["limitation"],"Auto-extracted",snippet,.55 if snippet else .2,now()))
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (project_id,paper_id,values["problem"],values["method"],values["dataset"],values["baseline"],values["metric"],values["result"],values["limitation"],source,snippet,.55 if snippet else .2,now()))
         row = conn.execute("SELECT * FROM evidence WHERE id=?", (cursor.lastrowid,)).fetchone()
-    return row_to_dict(row) or {}
+    result = row_to_dict(row) or {}
+    result["mode"] = source
+    return result
 
 
 def update_evidence(evidence_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -401,37 +445,71 @@ def create_claim(project_id: int, data: dict[str, Any]) -> dict[str, Any]:
     return next(claim for claim in list_claims(project_id) if claim["id"] == claim_id)
 
 
-def analyze_gap(project_id: int) -> dict[str, Any]:
-    project = get_project(project_id)
+def analyze_gap(project_id: int, lang: str = "zh") -> dict[str, Any]:
+    project = get_project(project_id, lang)
     evidence = list_evidence(project_id)
     claims = list_claims(project_id)
     if not evidence:
         return {"gap": "当前没有结构化证据，无法生成可追溯 Research Gap。", "citations": [], "coverage": []}
     weak = [item for item in evidence if float(item.get("confidence") or 0) < .6]
     citations = [item["paper_id"] for item in evidence[:5]]
-    gap = f"项目已有 {len(evidence)} 条证据与 {len(claims)} 个 Claim，但低置信证据占 {len(weak)} 条。不同数据子集上的稳定性、负面结果与方法成本尚未形成充分交叉验证。建议优先设计分组对照实验，并用真实导入文献替换 demo/sample 证据。"
+    ai_gap = ai.gap_analysis(project, evidence, claims, lang)
+    mode = "deterministic-fallback"
     contradictions: list[str] = []
-    if weak:
-        contradictions.append(f"有 {len(weak)} 条低置信证据需要复核后确认结论方向。")
-    if len(claims) < len(evidence):
-        contradictions.append("部分证据尚未转化为可追溯的 Claim，结论覆盖面可能不完整。")
+    if ai_gap and str(ai_gap.get("gap") or "").strip():
+        gap = str(ai_gap["gap"]).strip()
+        contradictions = [str(x).strip() for x in (ai_gap.get("contradictions") or []) if str(x).strip()]
+        mode = f"ai:{llm.active_provider()}"
+    else:
+        gap = f"项目已有 {len(evidence)} 条证据与 {len(claims)} 个 Claim，但低置信证据占 {len(weak)} 条。不同数据子集上的稳定性、负面结果与方法成本尚未形成充分交叉验证。建议优先设计分组对照实验，并用真实导入文献替换 demo/sample 证据。"
+        if weak:
+            contradictions.append(f"有 {len(weak)} 条低置信证据需要复核后确认结论方向。")
+        if len(claims) < len(evidence):
+            contradictions.append("部分证据尚未转化为可追溯的 Claim，结论覆盖面可能不完整。")
     if not contradictions:
-        contradictions.append("当前证据之间尚未发现明显矛盾，仍需扩大来源范围以验证结论稳定性。")
+        contradictions = ["当前证据之间尚未发现明显矛盾，仍需扩大来源范围以验证结论稳定性。"]
     update_project(project_id, {"research_gap": gap, "gap_citations": citations, "stage": "design"})
-    return {"gap": gap, "citations": citations, "coverage": [{"question": rq, "evidence_count": max(0, len(evidence)//max(1,len(project["research_questions"]))) } for rq in project["research_questions"]], "contradictions": contradictions}
+    return {"gap": gap, "citations": citations, "coverage": [{"question": rq, "evidence_count": max(0, len(evidence)//max(1,len(project["research_questions"]))) } for rq in project["research_questions"]], "contradictions": contradictions, "mode": mode}
 
 
-def create_research_design(project_id: int) -> dict[str, Any]:
-    project = get_project(project_id)
+def create_research_design(project_id: int, lang: str = "zh") -> dict[str, Any]:
+    project = get_project(project_id, lang)
     topic = (project["idea"] or project["name"]).strip().rstrip("。.!?！？")
     rq = project["research_questions"] or [f"How does {topic} compare with the baseline on the target task?"]
     hypothesis = (project["hypotheses"] or ["The proposed method improves the primary metric over the baseline."])[0]
     metrics = ["Primary effect metric", "Runtime cost / latency"]
     controls = ["Dataset and split", "Parameters", "Random seed"]
     risks = ["Data leakage", "Metric selection bias", "Insufficient sample size", "Unverified evidence"]
+    baselines = [f"Baseline Control: {topic}"]
+    control_name = f"Baseline Control: {topic}"
+    treatment_name = f"Proposed Method: {topic}"
+    evaluation = "Paired comparison + subgroup analysis"
+    expected_output = "Paired results with confidence intervals and subgroup analysis."
+    dataset_note = "Compare all conditions on the same dataset and split."
+    variables = {"independent": "Method / treatment configuration", "dependent": metrics, "controls": controls}
+    mode = "deterministic-fallback"
+    ai_design = ai.research_design(project, len(list_evidence(project_id)), lang)
+    if ai_design:
+        hypothesis = str(ai_design.get("hypothesis") or hypothesis)
+        ai_vars = ai_design.get("variables") or {}
+        variables = {
+            "independent": str(ai_vars.get("independent") or variables["independent"]),
+            "dependent": [str(x).strip() for x in (ai_vars.get("dependent") or []) if str(x).strip()] or variables["dependent"],
+            "controls": [str(x).strip() for x in (ai_vars.get("controls") or []) if str(x).strip()] or variables["controls"],
+        }
+        metrics = [str(x).strip() for x in (ai_design.get("metrics") or []) if str(x).strip()] or metrics
+        risks = [str(x).strip() for x in (ai_design.get("risks") or []) if str(x).strip()] or risks
+        baselines = [str(x).strip() for x in (ai_design.get("baselines") or []) if str(x).strip()] or baselines
+        dataset_note = str(ai_design.get("dataset") or dataset_note)
+        expected_output = str(ai_design.get("expected_output") or expected_output)
+        flow = ai_design.get("design_flow") or {}
+        control_name = str(flow.get("control") or baselines[0])
+        treatment_name = str(flow.get("treatment") or treatment_name)
+        evaluation = str(flow.get("evaluation") or evaluation)
+        mode = f"ai:{llm.active_provider()}"
     designs = [
-        {"name":f"Baseline Control: {topic}","research_question":rq[0],"hypothesis":"Establish a reproducible baseline.","description":"Fix the dataset and parameters, then record the baseline on the primary metric.","status":"Ready","input":"Baseline configuration","dataset":"Project dataset","metrics":metrics},
-        {"name":f"Proposed Method: {topic}","research_question":rq[0],"hypothesis":hypothesis,"description":"Change only the core independent variable and compare against the baseline in pairs.","status":"Planned","input":"Proposed configuration","dataset":"Same project dataset","metrics":metrics},
+        {"name":control_name,"research_question":rq[0],"hypothesis":"Establish a reproducible baseline.","description":"Fix the dataset and parameters, then record the baseline on the primary metric.","status":"Ready","input":"Baseline configuration","dataset":"Project dataset","metrics":metrics},
+        {"name":treatment_name,"research_question":rq[0],"hypothesis":hypothesis,"description":"Change only the core independent variable and compare against the baseline in pairs.","status":"Planned","input":"Proposed configuration","dataset":"Same project dataset","metrics":metrics},
     ]
     created = []
     with connection() as conn:
@@ -443,13 +521,14 @@ def create_research_design(project_id: int) -> dict[str, Any]:
     return {
         "topic": topic,
         "hypothesis": hypothesis,
-        "variables": {"independent": "Method / treatment configuration", "dependent": metrics, "controls": controls},
-        "dataset": "Compare all conditions on the same dataset and split.",
-        "baselines": [designs[0]["name"]],
+        "variables": variables,
+        "dataset": dataset_note,
+        "baselines": baselines,
         "metrics": metrics,
         "risks": risks,
-        "expected_output": "Paired results with confidence intervals and subgroup analysis.",
-        "design_flow": {"control": designs[0]["name"], "treatment": designs[1]["name"], "evaluation": "Paired comparison + subgroup analysis"},
+        "expected_output": expected_output,
+        "design_flow": {"control": designs[0]["name"], "treatment": designs[1]["name"], "evaluation": evaluation},
+        "mode": mode,
         "created_experiment_ids": created,
     }
 
@@ -551,23 +630,29 @@ def save_manuscript(project_id: int, section: str, content: str) -> dict[str, An
     return row_to_dict(row) or {}
 
 
-def draft_section(project_id: int, section: str) -> dict[str, Any]:
-    project = get_project(project_id)
+def draft_section(project_id: int, section: str, lang: str = "zh") -> dict[str, Any]:
+    project = get_project(project_id, lang)
     evidence = list_evidence(project_id)
     cited = [item for item in evidence if item.get("result") or item.get("method")]
-    if not cited:
+    citations: list[dict[str, Any]] = []
+    mode = "citation-aware deterministic draft"
+    ai_draft = ai.section_draft(section, cited, lang) if cited else None
+    if ai_draft and ai_draft.strip():
+        content = ai_draft.strip()
+        mode = f"ai:{llm.active_provider()}"
+        for item in cited[:3]:
+            citations.append({"paper_id":item["paper_id"],"evidence_id":item["id"],"title":item.get("paper_title"),"snippet":item.get("source_snippet")})
+    elif not cited:
         content = f"{section} 草稿：该陈述当前缺少项目文献证据。请先在 Evidence Matrix 中提取并核验证据。"
-        citations: list[dict[str, Any]] = []
     else:
         snippets = []
-        citations = []
         for item in cited[:3]:
             statement = item.get("result") or item.get("method")
             snippets.append(f"{statement} [Paper {item['paper_id']}; Evidence {item['id']}]")
             citations.append({"paper_id":item["paper_id"],"evidence_id":item["id"],"title":item.get("paper_title"),"snippet":item.get("source_snippet")})
         content = f"{section} 证据辅助草稿：" + " ".join(snippets) + " 未被项目证据支持的推论需在提交前删除或补充来源。"
     saved = save_manuscript(project_id, section, content)
-    return {"section":saved,"citations":citations,"project":project["name"],"mode":"citation-aware deterministic draft"}
+    return {"section":saved,"citations":citations,"project":project["name"],"mode":mode}
 
 
 def export_evidence_csv(project_id: int) -> str:

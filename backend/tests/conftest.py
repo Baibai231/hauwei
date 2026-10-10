@@ -5,6 +5,8 @@ from pathlib import Path
 
 TEST_DB = Path(__file__).parent / "test_scholarflow.db"
 os.environ["SCHOLARFLOW_DB_PATH"] = str(TEST_DB)
+# Tests must stay deterministic and offline: never call a live model or browser bridge.
+os.environ["AI_PROVIDER"] = "off"
 
 import pytest
 from fastapi.testclient import TestClient

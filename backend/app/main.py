@@ -5,15 +5,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import services
-from .config import CHART_DIR
+from . import llm, services
+from .config import CHART_DIR, GENIOS_TOOL_TOKEN
 from .database import init_db
-from .llm import configured as llm_configured
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("scholarflow")
@@ -41,6 +40,22 @@ app.add_middleware(
 app.mount("/api/charts", StaticFiles(directory=CHART_DIR), name="charts")
 
 
+@app.middleware("http")
+async def genios_tool_auth(request: Request, call_next):
+    """Protect the GeniOS tool endpoints with a shared token before public exposure.
+
+    When GENIOS_TOOL_TOKEN is unset the endpoints stay open for local development;
+    once it is set, every /api/genios/* call must send `Authorization: Bearer <token>`.
+    """
+    if GENIOS_TOOL_TOKEN and request.url.path.startswith("/api/genios/"):
+        if request.headers.get("authorization") != f"Bearer {GENIOS_TOOL_TOKEN}":
+            return JSONResponse(
+                status_code=401,
+                content={"ok": False, "error": {"code": "unauthorized", "message": "Invalid or missing tool token"}},
+            )
+    return await call_next(request)
+
+
 @app.exception_handler(services.NotFoundError)
 async def not_found_handler(_, exc: services.NotFoundError):
     from fastapi.responses import JSONResponse
@@ -59,7 +74,15 @@ def ok(data: Any, **meta: Any) -> dict[str, Any]:
 
 @app.get("/api/health")
 def health():
-    return ok({"status": "healthy", "llm_configured": llm_configured(), "orchestrator": "Nankai GeniOS Agent", "demo_mode": not llm_configured()})
+    status = llm.describe()
+    return ok({
+        "status": "healthy",
+        "orchestrator": "Nankai GeniOS Agent",
+        "llm_configured": status["ai_configured"],
+        "demo_mode": not status["ai_configured"],
+        "tool_auth_required": bool(GENIOS_TOOL_TOKEN),
+        **status,
+    })
 
 
 @app.get("/api/projects")
@@ -90,7 +113,7 @@ def delete_project(project_id: int):
 
 @app.post("/api/projects/{project_id}/plan")
 def plan_project(project_id: int, payload: dict[str, Any] = Body(default={})):
-    return ok(services.plan_research(project_id, payload.get("idea")))
+    return ok(services.plan_research(project_id, payload.get("idea"), str(payload.get("lang") or "zh")))
 
 
 @app.get("/api/projects/{project_id}/papers")
@@ -134,7 +157,7 @@ async def upload_pdf(project_id: int, file: UploadFile = File(...)):
 
 @app.post("/api/papers/{paper_id}/ask")
 def ask_paper(paper_id: int, payload: dict[str, Any] = Body(...)):
-    return ok(services.ask_paper(paper_id, str(payload.get("question") or "总结论文的主要贡献")))
+    return ok(services.ask_paper(paper_id, str(payload.get("question") or "总结论文的主要贡献"), str(payload.get("lang") or "zh")))
 
 
 @app.get("/api/projects/{project_id}/evidence")
@@ -149,7 +172,7 @@ def update_evidence(evidence_id: int, payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/projects/{project_id}/evidence/extract")
 def extract_evidence(project_id: int, payload: dict[str, Any] = Body(...)):
-    return ok(services.extract_evidence(project_id, int(payload["paper_id"])))
+    return ok(services.extract_evidence(project_id, int(payload["paper_id"]), str(payload.get("lang") or "zh")))
 
 
 @app.get("/api/projects/{project_id}/evidence.csv", response_class=PlainTextResponse)
@@ -168,13 +191,13 @@ def create_claim(project_id: int, payload: dict[str, Any] = Body(...)):
 
 
 @app.post("/api/projects/{project_id}/gap")
-def analyze_gap(project_id: int):
-    return ok(services.analyze_gap(project_id))
+def analyze_gap(project_id: int, payload: dict[str, Any] = Body(default={})):
+    return ok(services.analyze_gap(project_id, str(payload.get("lang") or "zh")))
 
 
 @app.post("/api/projects/{project_id}/research-design")
-def research_design(project_id: int):
-    return ok(services.create_research_design(project_id))
+def research_design(project_id: int, payload: dict[str, Any] = Body(default={})):
+    return ok(services.create_research_design(project_id, str(payload.get("lang") or "zh")))
 
 
 @app.get("/api/projects/{project_id}/experiments")
@@ -212,7 +235,7 @@ def save_manuscript(project_id: int, section: str, payload: dict[str, Any] = Bod
 
 @app.post("/api/projects/{project_id}/writing/draft")
 def draft_manuscript(project_id: int, payload: dict[str, Any] = Body(...)):
-    return ok(services.draft_section(project_id, str(payload.get("section") or "Introduction")))
+    return ok(services.draft_section(project_id, str(payload.get("section") or "Introduction"), str(payload.get("lang") or "zh")))
 
 
 # GeniOS adapter endpoints: JSON-only tool contracts. These deliberately contain no
@@ -229,7 +252,7 @@ def genios_project_status(payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/genios/research/plan")
 def genios_research_plan(payload: dict[str, Any] = Body(...)):
-    return ok(services.plan_research(int(payload["project_id"]), payload.get("idea")), tool="research_plan")
+    return ok(services.plan_research(int(payload["project_id"]), payload.get("idea"), str(payload.get("lang") or "zh")), tool="research_plan")
 
 
 @app.post("/api/genios/literature/search")
@@ -256,22 +279,22 @@ def genios_paper_parse(payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/genios/paper/ask")
 def genios_paper_ask(payload: dict[str, Any] = Body(...)):
-    return ok(services.ask_paper(int(payload["paper_id"]), str(payload["question"])), tool="paper_ask")
+    return ok(services.ask_paper(int(payload["paper_id"]), str(payload["question"]), str(payload.get("lang") or "zh")), tool="paper_ask")
 
 
 @app.post("/api/genios/evidence/extract")
 def genios_evidence_extract(payload: dict[str, Any] = Body(...)):
-    return ok(services.extract_evidence(int(payload["project_id"]), int(payload["paper_id"])), tool="evidence_extract")
+    return ok(services.extract_evidence(int(payload["project_id"]), int(payload["paper_id"]), str(payload.get("lang") or "zh")), tool="evidence_extract")
 
 
 @app.post("/api/genios/gap/analyze")
 def genios_gap_analyze(payload: dict[str, Any] = Body(...)):
-    return ok(services.analyze_gap(int(payload["project_id"])), tool="gap_analyze")
+    return ok(services.analyze_gap(int(payload["project_id"]), str(payload.get("lang") or "zh")), tool="gap_analyze")
 
 
 @app.post("/api/genios/research/design")
 def genios_research_design(payload: dict[str, Any] = Body(...)):
-    return ok(services.create_research_design(int(payload["project_id"])), tool="research_design")
+    return ok(services.create_research_design(int(payload["project_id"]), str(payload.get("lang") or "zh")), tool="research_design")
 
 
 @app.post("/api/genios/data/analyze")
@@ -291,7 +314,7 @@ def genios_data_analyze(payload: dict[str, Any] = Body(...)):
 
 @app.post("/api/genios/writing/draft")
 def genios_writing_draft(payload: dict[str, Any] = Body(...)):
-    return ok(services.draft_section(int(payload["project_id"]), str(payload.get("section") or "Introduction")), tool="writing_draft")
+    return ok(services.draft_section(int(payload["project_id"]), str(payload.get("section") or "Introduction"), str(payload.get("lang") or "zh")), tool="writing_draft")
 
 
 @app.post("/api/genios/project/next-action")
