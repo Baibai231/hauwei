@@ -10,8 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import llm, services
-from .config import CHART_DIR, GENIOS_TOOL_TOKEN
+from . import genios_openapi, llm, services
+from .config import CHART_DIR, GENIOS_TOOL_TOKEN, PUBLIC_BASE_URL, PUBLIC_TOOL_ONLY
 from .database import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -40,14 +40,25 @@ app.add_middleware(
 app.mount("/api/charts", StaticFiles(directory=CHART_DIR), name="charts")
 
 
-@app.middleware("http")
-async def genios_tool_auth(request: Request, call_next):
-    """Protect the GeniOS tool endpoints with a shared token before public exposure.
+GENIOS_SPEC_PATH = "/api/genios/openapi.json"
 
-    When GENIOS_TOOL_TOKEN is unset the endpoints stay open for local development;
-    once it is set, every /api/genios/* call must send `Authorization: Bearer <token>`.
+
+@app.middleware("http")
+async def genios_guard(request: Request, call_next):
+    """Guard the GeniOS tool surface used for public (tunnel) exposure.
+
+    * ``PUBLIC_TOOL_ONLY`` blocks every non-tool path, so pointing a tunnel at this
+      instance cannot expose the project-management API.
+    * ``GENIOS_TOOL_TOKEN`` requires `Authorization: Bearer <token>` on tool calls.
+      The OpenAPI document itself stays readable so the platform can import it.
     """
-    if GENIOS_TOOL_TOKEN and request.url.path.startswith("/api/genios/"):
+    path = request.url.path
+    if PUBLIC_TOOL_ONLY and not path.startswith("/api/genios/"):
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": {"code": "forbidden", "message": "This instance exposes only the GeniOS tool endpoints"}},
+        )
+    if GENIOS_TOOL_TOKEN and path.startswith("/api/genios/") and path != GENIOS_SPEC_PATH:
         if request.headers.get("authorization") != f"Bearer {GENIOS_TOOL_TOKEN}":
             return JSONResponse(
                 status_code=401,
@@ -81,6 +92,8 @@ def health():
         "llm_configured": status["ai_configured"],
         "demo_mode": not status["ai_configured"],
         "tool_auth_required": bool(GENIOS_TOOL_TOKEN),
+        "public_tool_only": PUBLIC_TOOL_ONLY,
+        "public_base_url": PUBLIC_BASE_URL,
         **status,
     })
 
@@ -240,6 +253,12 @@ def draft_manuscript(project_id: int, payload: dict[str, Any] = Body(...)):
 
 # GeniOS adapter endpoints: JSON-only tool contracts. These deliberately contain no
 # orchestration loop; Nankai GeniOS remains the top-level Agent / Workflow runtime.
+@app.get("/api/genios/openapi.json")
+def genios_openapi_document():
+    """OpenAPI 3 schema with only the 13 tools — paste this URL into the platform."""
+    return JSONResponse(genios_openapi.build_spec(app, PUBLIC_BASE_URL))
+
+
 @app.post("/api/genios/project/create")
 def genios_project_create(payload: dict[str, Any] = Body(...)):
     return ok(services.create_project(payload), tool="project_create")

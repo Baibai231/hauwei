@@ -129,6 +129,48 @@ BROWSER_NEW_CONVERSATION=true
 - Coze 插件需要 OpenAPI 3 schema；`tools.json` 为 JSON Schema 形式，导入前需将 `$defs` / `$ref` 展开并转换。
 - 智能体提示词中需说明：项目状态通过上述工具读写，工具失败应如实说明，不得编造项目 ID。
 
+### 3.1 落地步骤（已在本机实测通过）
+
+本机已把「智能体调用本地工具」所需的两件事做好：**工具实例隔离**与**共享令牌**。剩下的是平台侧注册。
+
+**① 本机跑两个实例**
+
+```powershell
+cd C:\Users\21257\Desktop\ScholarFlow
+
+# 完整实例（网页工作台用，8000）
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+
+# 对外实例（只暴露 13 个工具，8001）
+$env:PUBLIC_TOOL_ONLY='1'
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8001
+```
+
+`PUBLIC_TOOL_ONLY=1` 时，除 `/api/genios/*` 外所有路径都返回 403，所以隧道即使泄露也拿不到项目数据；`/docs` 也被挡住。
+
+**② 开隧道指向 8001，并把地址写进 `.env`**
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8001
+# 输出形如 https://xxx-yyy.trycloudflare.com
+```
+
+把地址填进 `.env` 的 `PUBLIC_BASE_URL=`，然后重启 8001 实例（规格里的 servers 会用它）。
+
+**③ 在平台注册工具**
+
+- 打开智能体 →「插件 / 工具」→ 新建自定义插件 → 选择「通过 URL 导入 / OpenAPI」。
+- 填入：`https://<你的隧道域名>/api/genios/openapi.json`
+  （该地址是专门生成的规格，只含 13 个工具，operationId 已改成 `project_create`、`research_plan` 等可读名字。）
+- 认证方式选 **Bearer Token**，值填 `.env` 里的 `GENIOS_TOOL_TOKEN`：
+  ```powershell
+  Select-String -Path .env -Pattern '^GENIOS_TOOL_TOKEN=' | ForEach-Object { $_.Line }
+  ```
+- 保存后在平台逐个试跑 `project_status`（参数 `{"project_id":1}`），返回 `{"ok": true, ...}` 即接通。
+- 最后在智能体提示词里说明：项目状态通过这些工具读写；工具失败要如实说明，不得编造项目 ID。
+
+**已知限制**：cloudflared / localtunnel 的免费隧道地址**每次重启都会变**，URL 变了要同步更新 `.env` 的 `PUBLIC_BASE_URL` 并在平台重新导入；长期演示建议部署到固定域名的服务器。另外这个部署的网页会话会过期，过期后方案 C（浏览器桥接）会降级为规则模板。
+
 ## 四、验证清单
 
 | 检查项 | 期望结果 |

@@ -20,8 +20,9 @@ ScholarFlow 是面向大学生科研过程的项目工作台：把研究问题�
 | 本地网页工作台 | 可运行，项目增删改、文献、证据、实验、分析、写作全流程可用 |
 | AI 接入 | 已实现。支持 OpenAI 兼容接口、NK-GeniOS（Coze）API、本地浏览器桥接三种方式 |
 | 规则回退 | 未配置凭据时自动生效，功能不中断 |
-| 集成方向 | 仅本机出站：由本机调用平台或模型服务，不采用把后端暴露到公网的做法 |
+| 集成方向 | 默认仅本机出站（由本机调用平台或模型服务），另提供可选的反向集成模式供平台回调本地工具 |
 | 工具接口鉴权 | 内置可选访问令牌，设置 `GENIOS_TOOL_TOKEN` 后 `/api/genios/*` 需要 Bearer 认证 |
+| 反向集成（可选） | 已实现并实测：`PUBLIC_TOOL_ONLY` 实例只暴露 13 个工具、其余路径一律 403；`/api/genios/openapi.json` 可直接被平台导入 |
 | 南开智能体 | 平台侧已发布 `v1.0.0`，可对话与检索，详见 [平台部署状态](genios/deployment-status.md) |
 | 已验证 | 浏览器桥接方案实测通过，返回 `mode: ai:genios_browser` |
 | 已知限制 | 当前南开部署的 `/api/proxy` 被统一认证网关拦截，服务端直连 API 不可行，需使用浏览器桥接 |
@@ -44,6 +45,14 @@ ScholarFlow 是面向大学生科研过程的项目工作台：把研究问题�
 | GeniOS 工具接口 | 13 个 JSON HTTP 入口，供平台工作流调用，支持令牌鉴权 |
 
 所有 AI 功能都会在返回体中带上 `mode` 字段：`ai:openai`、`ai:coze`、`ai:genios_browser` 表示由模型生成，`deterministic-fallback` 表示回退到规则。界面会据此提示当前结果来源。
+
+界面与交互：
+
+- **中英文切换**：Settings 页可在中文与 English 之间切换，选择保存在浏览器本地；界面词条集中在 `frontend/src/i18n.tsx`。
+- **论文页返回**：论文阅读器左上角提供"返回文献库"按钮。
+- **实验看板推进**：实验卡片右下角箭头会把实验推进到下一列（计划中 → 就绪 → 进行中 → 已完成 → 失败），最后一列不再显示箭头。
+- **卡片悬浮微交互**：卡片悬浮时轻微上浮并提亮边框，并遵守系统"减少动态效果"设置。
+- **项目切换隔离**：切换项目时先等待新项目加载完成再渲染，避免上一个项目的状态残留。
 
 演示项目为 **RAG for LLM Vulnerability Detection**，首次初始化数据库时自动创建。`demo/sample` 论文、证据与草稿仅用于演示，不能用于支撑正式科研结论；真实检索结果保存 `openalex` 来源标记。
 
@@ -170,11 +179,31 @@ BROWSER_NEW_CONVERSATION=true
 
 ## 5. 集成方向
 
-本项目采用**本机出站**的集成方向：由本机后端主动调用平台或模型服务，平台无需访问本机。后端默认只监听 `127.0.0.1:8000`。
+### 5.1 默认：本机出站
 
-13 个工具接口（`/api/genios/*`）供本机或受控内网调用，不对外暴露。`GENIOS_TOOL_TOKEN` 为可选的访问令牌：设置后这些接口要求请求头 `Authorization: Bearer <令牌>`。
+由本机后端主动调用平台或模型服务，平台无需访问本机；后端默认只监听 `127.0.0.1:8000`。13 个工具接口（`/api/genios/*`）只在本机或受控内网使用。`GENIOS_TOOL_TOKEN` 为可选的访问令牌：设置后这些接口要求请求头 `Authorization: Bearer <令牌>`。
 
-若将来需要平台智能体反向调用这些工具，应改用内网部署或反向连接方式，详见 [`genios/ai-integration.md`](genios/ai-integration.md)。
+### 5.2 可选：反向集成（平台智能体回调本地工具）
+
+若要让平台智能体真正"调用本地工具"，本机需要给平台一个可达地址。项目为此提供了加固模式，避免把项目数据一起暴露：
+
+1. **只暴露工具**：用 `PUBLIC_TOOL_ONLY=1` 启动第二个实例（建议端口 `8001`）。该实例下除 `/api/genios/*` 外的所有路径（含 `/api/projects` 与 `/docs`）一律返回 403。
+2. **强制令牌**：在 `.env` 设置强随机 `GENIOS_TOOL_TOKEN`，工具调用必须带 `Authorization: Bearer <令牌>`。
+3. **导入规格**：`GET /api/genios/openapi.json` 返回只含 13 个工具、`operationId` 已可读化的 OpenAPI 3 文档，可直接填入平台的插件导入。
+4. **公网地址**：用隧道或服务器把该实例暴露出去，并把地址写进 `.env` 的 `PUBLIC_BASE_URL`（规格里的 `servers` 会使用它）。
+
+```powershell
+# 对外实例（只暴露工具）
+$env:PUBLIC_TOOL_ONLY='1'
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8001
+
+# 公网隧道（示例：cloudflared 快速隧道）
+cloudflared tunnel --url http://127.0.0.1:8001
+```
+
+实测结论：`/api/genios/openapi.json` 返回 200、无令牌调用返回 401、正确令牌返回 200、`/api/projects` 返回 403。注意免费隧道地址每次重启都会变化，需要同步更新 `PUBLIC_BASE_URL` 并在平台重新导入。
+
+详细步骤见 [`genios/ai-integration.md`](genios/ai-integration.md) 的「3.1 落地步骤」。
 
 ## 6. 配置项
 
@@ -191,6 +220,8 @@ BROWSER_NEW_CONVERSATION=true
 | `BROWSER_CDP_URL` / `BROWSER_TARGET_HOST` / `BROWSER_CHAT_URL` | 浏览器桥接配置 |
 | `BROWSER_TIMEOUT_SECONDS` / `BROWSER_NEW_CONVERSATION` | 桥接超时与是否每次新建会话 |
 | `GENIOS_TOOL_TOKEN` | `/api/genios/*` 的共享访问令牌，留空则为开放状态 |
+| `PUBLIC_TOOL_ONLY` | 设为 `1` 时该实例只提供 `/api/genios/*`，其余路径一律 403；用于对外实例，默认关闭 |
+| `PUBLIC_BASE_URL` | 对外实例写入 OpenAPI 规格的服务器地址（隧道或正式域名） |
 | `OPENALEX_EMAIL` | 可选，作为 OpenAlex 请求的联系邮箱 |
 | `SCHOLARFLOW_DB_PATH` | 可选，覆盖 SQLite 路径；默认 `data/scholarflow.db`，父目录需存在 |
 | `VITE_API_URL` | 前端可选 API 地址；需放在 `frontend/.env.local` |
@@ -225,7 +256,9 @@ flowchart LR
     A --> D[pandas / SciPy 数据分析]
 ```
 
-工具定义见 [`genios/tools.json`](genios/tools.json)，所有接口使用 `POST`。这些接口用于本机或受控内网环境，当前不将其暴露到公网。
+工具定义见 [`genios/tools.json`](genios/tools.json)，所有接口使用 `POST`，默认只在本机或受控内网使用。如需让平台智能体反向调用这些工具，按第 5.2 节启动"只暴露工具"的对外实例。
+
+对外实例额外提供 `GET /api/genios/openapi.json`：只包含下列 13 个工具、`operationId` 已可读化，可直接作为 OpenAPI 插件导入平台；该文档本身不需要令牌即可读取。
 
 | Tool | API 路径 |
 | --- | --- |
@@ -261,20 +294,29 @@ Invoke-RestMethod `
 ```text
 ScholarFlow/
 ├── backend/
-│   ├── app/                    # API、SQLite、状态机、AI Provider 与浏览器桥接
+│   ├── app/                    # API、SQLite、状态机、AI Provider、浏览器桥接、GeniOS 规格生成
+│   │   ├── ai.py               # 各 AI 功能的提示词层
+│   │   ├── llm.py              # OpenAI 兼容 / Coze / 浏览器桥接三种 Provider
+│   │   ├── browser_bridge.py   # 通过本机 CDP 复用已登录浏览器
+│   │   └── genios_openapi.py   # 只含 13 个工具的 OpenAPI 文档
 │   ├── scripts/                # check_genios.py、check_secrets.py
 │   ├── tests/                  # API 与流程测试
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/                    # React + TypeScript 页面
+│   │   ├── i18n.tsx            # 中英文界面词条与语言切换
+│   │   └── interactions.css    # 卡片悬浮微交互
 │   └── package-lock.json       # 前端依赖锁文件，必须提交
 ├── genios/
 │   ├── tools.json              # 13 个 GeniOS 工具定义
 │   ├── ai-integration.md       # AI 接入完整说明
 │   ├── deployment-status.md    # 平台部署状态
 │   ├── agent-prompt.md         # 智能体提示词
+│   ├── agent-greeting.md       # 智能体开场白
+│   ├── demo-guide.md           # 演示说明
 │   └── acceptance-tests.md     # 平台验收记录
 ├── data/                       # 本地数据库、上传文件与图表（不提交）
+├── docs/                       # 本地笔记与使用手册（已 gitignore，不提交）
 ├── vendor/README.md            # 第三方集成说明
 ├── .github/workflows/ci.yml    # 后端测试与前端构建
 ├── .env.example                # 配置模板（不含真实密钥）

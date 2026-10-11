@@ -12,7 +12,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.database import init_db
+from app import main as app_main
 from app.main import app
+
+# The tests exercise the tool endpoints directly, so disable the public-exposure
+# guards that a real .env (with GENIOS_TOOL_TOKEN) would otherwise switch on.
+app_main.GENIOS_TOOL_TOKEN = ""
+app_main.PUBLIC_TOOL_ONLY = False
 
 
 @pytest.fixture(scope="session")

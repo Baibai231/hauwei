@@ -64,4 +64,11 @@ BROWSER_NEW_CONVERSATION = os.getenv("BROWSER_NEW_CONVERSATION", "true").strip()
 # Shared secret required from the Nankai agent when it calls the local /api/genios/* tools.
 GENIOS_TOOL_TOKEN = os.getenv("GENIOS_TOOL_TOKEN", "")
 
+# Public-exposure mode: when enabled, ONLY /api/genios/* is served. Run a second
+# instance with this on (plus GENIOS_TOOL_TOKEN) and point the tunnel at it, so the
+# rest of the project API is never exposed to the internet.
+PUBLIC_TOOL_ONLY = os.getenv("PUBLIC_TOOL_ONLY", "").strip().lower() in {"1", "true", "yes"}
+# Base URL that goes into the generated OpenAPI document (your public tunnel URL).
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
+
 OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "")
